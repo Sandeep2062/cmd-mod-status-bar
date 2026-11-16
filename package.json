@@ -1,0 +1,42 @@
+{
+  "name": "cmd-mod-status-bar",
+  "version": "1.0.0",
+  "description": "Clean responsive status bar footer with live limits, compaction-aware context, and workspace tab titling for Command Code",
+  "main": "index.js",
+  "type": "module",
+  "keywords": [
+    "command-code-mod",
+    "cmd-mod",
+    "cmd-mod-widget",
+    "cmd-mod-hook",
+    "statusline",
+    "footer",
+    "status-bar",
+    "terminal-title"
+  ],
+  "author": {
+    "name": "Sandeep Khadka",
+    "email": "sandeepkhadka9090@gmail.com",
+    "url": "https://github.com/Sandeep2062"
+  },
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Sandeep2062/cmd-mod-status-bar.git"
+  },
+  "bugs": {
+    "url": "https://github.com/Sandeep2062/cmd-mod-status-bar/issues"
+  },
+  "homepage": "https://github.com/Sandeep2062/cmd-mod-status-bar#readme",
+  "commandcode": {
+    "mods": [
+      "./index.js"
+    ]
+  },
+  "files": [
+    "index.js",
+    "package.json",
+    "README.md",
+    "LICENSE"
+  ]
+}
