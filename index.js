@@ -2,10 +2,6 @@ import https from 'https';
 import fs from 'fs';
 import path from 'path';
 
-/**
- * Format millisecond duration into a concise human-readable time string.
- * Examples: '4h 47m', '6d 3h', '25m'.
- */
 function formatDuration(ms) {
   if (typeof ms !== 'number' || isNaN(ms) || ms <= 0) return '0m';
   const totalMinutes = Math.max(1, Math.ceil(ms / 60000));
@@ -21,10 +17,6 @@ function formatDuration(ms) {
   return `${mins}m`;
 }
 
-/**
- * Format token count and percentage against a context window limit.
- * Examples: 'ctx 95k/1M · 9%', 'ctx 1.2M/2M · 60%'.
- */
 function formatTokens(tokens, limit = 1000000) {
   if (typeof tokens !== 'number' || isNaN(tokens) || tokens <= 0) return 'ctx 0k/1M · 0%';
   const kTokens = tokens >= 1000000
@@ -36,9 +28,6 @@ function formatTokens(tokens, limit = 1000000) {
   return `ctx ${kTokens}/${limitStr} · ${pct}%`;
 }
 
-/**
- * Resolve repository name and active git branch from working directory.
- */
 function findRepoInfo(startDir = process.cwd()) {
   let curr = path.resolve(startDir);
   let repoName = path.basename(curr);
@@ -66,10 +55,6 @@ function findRepoInfo(startDir = process.cwd()) {
   return { repoName, branch };
 }
 
-/**
- * Manage sequential tab numbering across active Command Code sessions.
- * e.g. First session: 'PixVault', second session: 'PixVault (2)'.
- */
 function getTabTitle(repoName, cwd) {
   try {
     const home = process.env.USERPROFILE || process.env.HOME || '';
@@ -118,9 +103,6 @@ function getTabTitle(repoName, cwd) {
   }
 }
 
-/**
- * Remove current process PID from active tabs registry on session exit.
- */
 function cleanupInstance() {
   try {
     const home = process.env.USERPROFILE || process.env.HOME || '';
@@ -139,9 +121,6 @@ try {
   process.on('SIGTERM', cleanupInstance);
 } catch {}
 
-/**
- * Scan session transcript on disk with full compaction offset awareness.
- */
 function getLatestContextUsage(workingDir = process.cwd()) {
   try {
     const home = process.env.USERPROFILE || process.env.HOME || '';
@@ -209,9 +188,6 @@ function getLatestContextUsage(workingDir = process.cwd()) {
   return null;
 }
 
-/**
- * Fetch rolling quota usage (5-hour and weekly) from Command Code API.
- */
 function fetchUsage(authKey) {
   return new Promise((resolve) => {
     if (!authKey) return resolve(null);
@@ -241,9 +217,6 @@ function fetchUsage(authKey) {
   });
 }
 
-/**
- * Retrieve user auth token from ~/.commandcode/auth.json.
- */
 function getAuthKey() {
   try {
     const home = process.env.USERPROFILE || process.env.HOME || '';
@@ -256,10 +229,6 @@ function getAuthKey() {
   return null;
 }
 
-/**
- * Command Code Mod Factory
- * @param {import('@commandcode/harness').ModApi} cmd
- */
 export default function statusBarMod(cmd) {
   const authKey = getAuthKey();
   let cachedCtx = null;
@@ -393,7 +362,6 @@ export default function statusBarMod(cmd) {
     cleanupInstance();
   }
 
-  // Register responsive widget below editor
   if (cmd.ui && typeof cmd.ui.widget === 'function') {
     cmd.ui.widget({
       placement: 'below-editor',
@@ -416,13 +384,11 @@ export default function statusBarMod(cmd) {
 
         const partsRight = [ctxUsage, limitsCombined].filter(Boolean).join(' · ');
 
-        // Candidate 1: Single line (when terminal width allows)
         const singleLine = `${partProject} · ${partModel} · ${partsRight}`;
         if (singleLine.length <= termWidth - 4) {
           return [singleLine];
         }
 
-        // Candidate 2: Two lines (responsive split)
         const compactLimits = updateLimitsStrings(false);
         const compactRight = [ctxUsage, `${compactLimits.fhStr} · ${compactLimits.wkStr}`].filter(Boolean).join(' · ');
         const line1 = `${partProject} · ${partModel}`;
@@ -432,7 +398,6 @@ export default function statusBarMod(cmd) {
           return [line1, line2];
         }
 
-        // Candidate 3: Three lines (narrow / vertical split)
         return [
           partProject,
           partModel,
@@ -442,11 +407,9 @@ export default function statusBarMod(cmd) {
     });
   }
 
-  // Set initial tab title and fetch usage
   applyTabTitle();
   refreshUsage();
 
-  // Model change tracker
   if (typeof cmd.on === 'function') {
     cmd.on('model_request_start', (evt) => {
       if (evt && evt.model) {
@@ -459,7 +422,6 @@ export default function statusBarMod(cmd) {
     cmd.on('session_shutdown', teardown);
   }
 
-  // Setup timers using cmd.clock where available, fallback to unref'd setInterval
   if (cmd.clock && typeof cmd.clock.every === 'function') {
     try {
       cmd.clock.every(2000, pollContextAndTitle);
@@ -477,7 +439,6 @@ export default function statusBarMod(cmd) {
     if (typeof billingTimer.unref === 'function') billingTimer.unref();
   }
 
-  // Register hooks for turn boundaries and compaction updates
   if (typeof cmd.hooks === 'function') {
     cmd.hooks({
       onTurnStart(payload) {
