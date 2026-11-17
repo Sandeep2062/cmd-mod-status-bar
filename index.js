@@ -312,7 +312,7 @@ function reconstructContextEntries(pathEntries) {
   }
 
   if (compactionIdx === -1) {
-    return { compactionIdx, keptEntries: pathEntries, stripIds: null };
+    return { compactionIdx, keptEntries: pathEntries, stripIds: null, hasCompaction: false };
   }
 
   const comp = pathEntries[compactionIdx];
@@ -377,12 +377,14 @@ function getLatestContextUsage(workingDir = process.cwd(), liveSessionId = null)
     }
     pathEntries.reverse();
 
-    const { compactionIdx, keptEntries, stripIds } = reconstructContextEntries(pathEntries);
+    const { keptEntries, stripIds, hasCompaction } = reconstructContextEntries(pathEntries);
 
     // Real API usage already accounts for system prompt, memory files, tools,
     // and MCP schemas, which a pure message-character estimate cannot see.
+    // Usage recorded before the latest compaction describes a different
+    // context, so only entries after the compaction summary qualify.
     let usageIdx = -1;
-    for (let i = keptEntries.length - 1; i >= 0; i--) {
+    for (let i = keptEntries.length - 1; i >= (hasCompaction ? 1 : 0); i--) {
       const usage = keptEntries[i].usage;
       if (usage && typeof usage.inputTokens === 'number' && usage.inputTokens > 0) {
         usageIdx = i;
@@ -404,7 +406,7 @@ function getLatestContextUsage(workingDir = process.cwd(), liveSessionId = null)
       tokens = estimateConversationTokens(keptEntries, stripIds) + SYSTEM_TOOLS_AND_SKILLS;
     }
 
-    return { tokens, file: target.name, mtime: target.mtime };
+    return { tokens, hasRealUsage: usageIdx !== -1, file: target.name, mtime: target.mtime };
   } catch {}
   return null;
 }
@@ -635,21 +637,27 @@ export default function statusBarMod(cmd) {
 
   function getActiveContextUsage(workingDir) {
     const host = readHostContextUsage();
+    const disk = getDiskContextUsage(workingDir);
 
-    if (compactionOverride && Date.now() - compactionOverride.at > 60000) {
+    // On a resumed session the host tracker has no remembered state and
+    // reports a message-only estimate, so trust the log's real API usage.
+    const diskReal = (disk && disk.hasRealUsage &&
+      (!compactionOverride || disk.mtime > compactionOverride.at)) ? disk.tokens : 0;
+    const hostTokens = host ? host.tokens : 0;
+    const maxTokens = Math.max(hostTokens, diskReal);
+
+    if (compactionOverride) {
+      const fresh = Date.now() - compactionOverride.at < 5000;
+      if (fresh || maxTokens < compactionOverride.tokens) {
+        return formatTokens(compactionOverride.tokens, compactionOverride.limit);
+      }
       compactionOverride = null;
     }
-    // After a compaction the host tracker still reports the pre-compaction
-    // basis for a moment, so keep the event value until the host catches up.
-    if (compactionOverride && (!host || host.tokens < compactionOverride.tokens)) {
-      return formatTokens(compactionOverride.tokens, compactionOverride.limit);
-    }
-    compactionOverride = null;
 
-    if (host) return formatTokens(host.tokens, host.limit);
+    if (maxTokens > 0) return formatTokens(maxTokens, (host && host.limit) || lastKnownLimit);
 
-    const disk = getDiskContextUsage(workingDir);
     if (disk) return formatTokens(disk.tokens, lastKnownLimit);
+    if (host) return formatTokens(host.tokens, host.limit);
 
     return 'ctx 0k/1M · 0%';
   }
@@ -684,6 +692,7 @@ export default function statusBarMod(cmd) {
         if (files.length > 0 && files[0].mtime !== lastMtime) {
           lastMtime = files[0].mtime;
           diskCache = null;
+          getDiskContextUsage(workingDir);
           if (cmd.ui && typeof cmd.ui.refreshWidgets === 'function') {
             cmd.ui.refreshWidgets();
           }
