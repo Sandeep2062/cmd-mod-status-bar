@@ -121,6 +121,62 @@ try {
   process.on('SIGTERM', cleanupInstance);
 } catch {}
 
+const TOKEN_CHAR_RATIO = 3.5;
+const SYSTEM_TOOLS_AND_SKILLS = 17000;
+
+function estimateTextTokens(str) {
+  if (!str) return 0;
+  const s = typeof str === 'string' ? str : String(str);
+  const n = s.length / TOKEN_CHAR_RATIO;
+  const o = 0.1 * s.split(/\s+/).length;
+  return Math.max(0, Math.ceil(n - o));
+}
+
+function estimateMessageTokens(m) {
+  if (!m) return 0;
+  let tokens = 3;
+  const content = m.content;
+  if (typeof content === 'string') return tokens + estimateTextTokens(content);
+  if (Array.isArray(content)) {
+    for (const b of content) {
+      if (!b) continue;
+      if (b.type === 'text') {
+        tokens += estimateTextTokens(b.text || '');
+      } else if (b.type === 'tool_use' || b.type === 'tool-call') {
+        tokens += 5;
+        const name = b.name || b.toolName;
+        if (name) tokens += estimateTextTokens(name);
+        const input = b.input || b.arguments;
+        if (input) tokens += Math.ceil(estimateTextTokens(JSON.stringify(input)) * 1.1);
+      } else if (b.type === 'tool_result' || b.type === 'tool-result') {
+        tokens += 3;
+        let val = '';
+        if (typeof b.content === 'string') val = b.content;
+        else if (Array.isArray(b.content)) {
+          val = b.content.map(c => typeof c === 'string' ? c : (c.text || JSON.stringify(c))).join('\n');
+        } else if (b.output && typeof b.output === 'object' && b.output.value) {
+          val = b.output.value;
+        }
+        tokens += estimateTextTokens(val);
+      } else if (b.type === 'image') {
+        tokens += 1229;
+      }
+    }
+  }
+  return Math.ceil(tokens);
+}
+
+function calculateConversationTokens(messages) {
+  if (!Array.isArray(messages) || messages.length === 0) return 0;
+  let total = SYSTEM_TOOLS_AND_SKILLS;
+  for (const m of messages) {
+    if (m && !m.meta?.isMeta) {
+      total += estimateMessageTokens(m);
+    }
+  }
+  return total;
+}
+
 function getLatestContextUsage(workingDir = process.cwd()) {
   try {
     const home = process.env.USERPROFILE || process.env.HOME || '';
@@ -144,46 +200,50 @@ function getLatestContextUsage(workingDir = process.cwd()) {
 
     if (files.length === 0) return null;
     const latestJsonl = path.join(projectStore, files[0].name);
-    const latestMeta = latestJsonl.replace(/\.jsonl$/, '.meta.json');
-
-    let metaCompaction = null;
-    if (fs.existsSync(latestMeta)) {
-      try {
-        const meta = JSON.parse(fs.readFileSync(latestMeta, 'utf8'));
-        if (meta.compaction && typeof meta.compaction.lastTokensSaved === 'number') {
-          metaCompaction = meta.compaction;
-        }
-      } catch {}
-    }
 
     const lines = fs.readFileSync(latestJsonl, 'utf8').trim().split('\n');
-    let lastUsageTokens = null;
-    let compactionSeenAfterUsage = false;
-    let compactionTokensBefore = null;
+    if (lines.length === 0) return null;
 
+    let lastCompactionIdx = -1;
     for (let i = lines.length - 1; i >= 0; i--) {
       try {
         const obj = JSON.parse(lines[i]);
         if (obj.type === 'compaction') {
-          if (lastUsageTokens === null) {
-            compactionSeenAfterUsage = true;
-            compactionTokensBefore = obj.tokensBefore || null;
-          }
-        }
-        if (obj.usage && typeof obj.usage.inputTokens === 'number') {
-          lastUsageTokens = obj.usage.inputTokens;
+          lastCompactionIdx = i;
           break;
         }
       } catch {}
     }
 
-    let activeTokens = lastUsageTokens || 0;
-    if (compactionSeenAfterUsage && metaCompaction) {
-      const base = compactionTokensBefore || lastUsageTokens || 0;
-      activeTokens = Math.max(0, base - metaCompaction.lastTokensSaved);
+    const startIdx = lastCompactionIdx !== -1 ? lastCompactionIdx : 0;
+    let conversationTokens = 0;
+    let latestPostCompactionApiTokens = 0;
+
+    if (lastCompactionIdx !== -1) {
+      try {
+        const comp = JSON.parse(lines[lastCompactionIdx]);
+        if (comp.summary) {
+          conversationTokens += estimateTextTokens(comp.summary);
+        }
+      } catch {}
     }
 
-    return formatTokens(activeTokens, 1000000);
+    for (let i = startIdx + 1; i < lines.length; i++) {
+      try {
+        const obj = JSON.parse(lines[i]);
+        if (obj.type === 'message' && obj.message && !obj.message.meta?.isMeta) {
+          conversationTokens += estimateMessageTokens(obj.message);
+        }
+        if (obj.usage && typeof obj.usage.inputTokens === 'number') {
+          latestPostCompactionApiTokens = obj.usage.inputTokens;
+        }
+      } catch {}
+    }
+
+    const estimatedTotal = conversationTokens + SYSTEM_TOOLS_AND_SKILLS;
+    const finalTokens = Math.max(estimatedTotal, latestPostCompactionApiTokens);
+
+    return formatTokens(finalTokens, 1000000);
   } catch {}
   return null;
 }
@@ -419,6 +479,27 @@ export default function statusBarMod(cmd) {
         }
       }
     });
+
+    cmd.on('compaction_outcome', (evt) => {
+      try {
+        if (evt && typeof evt.tokensAfter === 'number' && evt.tokensAfter > 0) {
+          cachedCtx = formatTokens(evt.tokensAfter + SYSTEM_TOOLS_AND_SKILLS, evt.contextLimit || 1000000);
+        } else {
+          cachedCtx = null;
+        }
+        if (cmd.ui && typeof cmd.ui.refreshWidgets === 'function') {
+          cmd.ui.refreshWidgets();
+        }
+      } catch {}
+    });
+
+    cmd.on('compaction_done', () => {
+      try {
+        cachedCtx = null;
+        pollContextAndTitle();
+      } catch {}
+    });
+
     cmd.on('session_shutdown', teardown);
   }
 
@@ -442,44 +523,44 @@ export default function statusBarMod(cmd) {
   if (typeof cmd.hooks === 'function') {
     cmd.hooks({
       onTurnStart(payload) {
-        applyTabTitle();
-        if (payload && payload.state && Array.isArray(payload.state.messages)) {
-          let chars = 0;
-          for (const m of payload.state.messages) {
-            if (typeof m.content === 'string') chars += m.content.length;
-            else if (Array.isArray(m.content)) {
-              for (const c of m.content) {
-                if (c.type === 'text') chars += (c.text || '').length;
+        try {
+          applyTabTitle();
+          if (payload && payload.state && Array.isArray(payload.state.messages)) {
+            const tokens = calculateConversationTokens(payload.state.messages);
+            if (tokens > 0) {
+              cachedCtx = formatTokens(tokens, 1000000);
+              if (cmd.ui && typeof cmd.ui.refreshWidgets === 'function') {
+                cmd.ui.refreshWidgets();
               }
             }
           }
-          if (chars > 0) {
-            const estimatedTokens = Math.round(chars / 4);
-            cachedCtx = formatTokens(estimatedTokens, 1000000);
-            if (cmd.ui && typeof cmd.ui.refreshWidgets === 'function') {
-              cmd.ui.refreshWidgets();
-            }
-          }
-        }
-        return payload?.state;
+        } catch {}
+        return (payload && payload.state !== undefined) ? payload.state : payload;
       },
       onTurnEnd(payload) {
-        applyTabTitle();
-        const { usage } = payload || {};
-        if (usage && typeof usage.inputTokens === 'number') {
-          cachedCtx = formatTokens(usage.inputTokens, 1000000);
-        }
-        if (cmd.ui && typeof cmd.ui.refreshWidgets === 'function') {
-          cmd.ui.refreshWidgets();
-        }
-        return payload?.state;
+        try {
+          applyTabTitle();
+          if (payload && payload.state && Array.isArray(payload.state.messages)) {
+            const tokens = calculateConversationTokens(payload.state.messages);
+            const usageTokens = (payload.usage && typeof payload.usage.inputTokens === 'number') ? payload.usage.inputTokens : 0;
+            const finalTokens = Math.max(tokens, usageTokens);
+            if (finalTokens > 0) {
+              cachedCtx = formatTokens(finalTokens, 1000000);
+            }
+          } else if (payload && payload.usage && typeof payload.usage.inputTokens === 'number') {
+            cachedCtx = formatTokens(payload.usage.inputTokens, 1000000);
+          }
+          if (cmd.ui && typeof cmd.ui.refreshWidgets === 'function') {
+            cmd.ui.refreshWidgets();
+          }
+        } catch {}
+        return (payload && payload.state !== undefined) ? payload.state : payload;
       },
       onRunEnd() {
-        applyTabTitle();
-        refreshUsage();
-      },
-      onSessionEnd() {
-        teardown();
+        try {
+          applyTabTitle();
+          refreshUsage();
+        } catch {}
       }
     });
   }

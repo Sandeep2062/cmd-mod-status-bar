@@ -1,6 +1,6 @@
 {
   "name": "cmd-mod-status-bar",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Clean responsive status bar footer with live limits, compaction-aware context, and workspace tab titling for Command Code",
   "main": "index.js",
   "type": "module",
