@@ -127,7 +127,11 @@ function cleanupInstance() {
 
 const TOKEN_CHAR_RATIO = 3.5;
 const JSON_RATIO = 1.1;
-const SYSTEM_TOOLS_AND_SKILLS = 17000;
+// Measured against the /context rows for Command Code's 22 built-in tools
+// (12.6k) and the loaded skill manifest (4.4k).
+const BUILTIN_TOOLS_TOKENS = 12600;
+const SKILLS_TOKENS = 4400;
+const SYSTEM_TOOLS_AND_SKILLS = BUILTIN_TOOLS_TOKENS + SKILLS_TOKENS;
 
 function estimateTextTokens(str) {
   if (!str) return 0;
@@ -312,7 +316,7 @@ function reconstructContextEntries(pathEntries) {
   }
 
   if (compactionIdx === -1) {
-    return { compactionIdx, keptEntries: pathEntries, stripIds: null, hasCompaction: false };
+    return { keptEntries: pathEntries, stripIds: null };
   }
 
   const comp = pathEntries[compactionIdx];
@@ -329,7 +333,7 @@ function reconstructContextEntries(pathEntries) {
   for (let i = compactionIdx + 1; i < pathEntries.length; i++) keptEntries.push(pathEntries[i]);
 
   const stripIds = new Set(pathEntries.slice(0, compactionIdx).map(e => e.id));
-  return { compactionIdx, keptEntries, stripIds };
+  return { keptEntries, stripIds };
 }
 
 function estimateConversationTokens(keptEntries, stripIds) {
@@ -344,7 +348,48 @@ function estimateConversationTokens(keptEntries, stripIds) {
   return tokens;
 }
 
-function getLatestContextUsage(workingDir = process.cwd(), liveSessionId = null) {
+function getMemoryFiles(workingDir) {
+  const home = process.env.USERPROFILE || process.env.HOME || '';
+  const root = path.resolve(workingDir);
+  const files = [];
+
+  if (process.platform === 'win32') {
+    files.push('C:\\ProgramData\\CommandCode\\AGENTS.md');
+  } else if (process.platform === 'darwin') {
+    files.push('/Library/Application Support/CommandCode/AGENTS.md');
+  } else {
+    files.push('/etc/.commandcode/AGENTS.md');
+  }
+
+  const projectFile = [path.join(root, 'AGENTS.md'), path.join(root, '.commandcode', 'AGENTS.md')]
+    .find(p => {
+      try { return fs.statSync(p).isFile(); } catch { return false; }
+    });
+  if (projectFile) files.push(projectFile);
+  files.push(path.join(home, '.commandcode', 'AGENTS.md'));
+
+  return files.filter(p => {
+    try { return fs.statSync(p).isFile(); } catch { return false; }
+  });
+}
+
+function estimateMemoryTokens(files) {
+  let tokens = 0;
+  for (const file of files) {
+    try {
+      tokens += estimateTokens3(fs.readFileSync(file, 'utf8'));
+    } catch {}
+  }
+  return tokens;
+}
+
+function getMemorySignature(files) {
+  return files.map(p => {
+    try { return fs.statSync(p).mtimeMs; } catch { return 0; }
+  }).join(':');
+}
+
+function getLatestContextUsage(workingDir = process.cwd(), liveSessionId = null, memoryFiles = null) {
   try {
     const projectStore = getProjectStoreDir(workingDir);
     if (!fs.existsSync(projectStore)) return null;
@@ -377,36 +422,15 @@ function getLatestContextUsage(workingDir = process.cwd(), liveSessionId = null)
     }
     pathEntries.reverse();
 
-    const { keptEntries, stripIds, hasCompaction } = reconstructContextEntries(pathEntries);
+    const { keptEntries, stripIds } = reconstructContextEntries(pathEntries);
 
-    // Real API usage already accounts for system prompt, memory files, tools,
-    // and MCP schemas, which a pure message-character estimate cannot see.
-    // Usage recorded before the latest compaction describes a different
-    // context, so only entries after the compaction summary qualify.
-    let usageIdx = -1;
-    for (let i = keptEntries.length - 1; i >= (hasCompaction ? 1 : 0); i--) {
-      const usage = keptEntries[i].usage;
-      if (usage && typeof usage.inputTokens === 'number' && usage.inputTokens > 0) {
-        usageIdx = i;
-        break;
-      }
-    }
+    // Mirrors Command Code's /context breakdown: estimated messages, memory
+    // files, and the built-in tools + loaded skills baseline.
+    const messagesTokens = estimateConversationTokens(keptEntries, stripIds);
+    const memoryTokens = estimateMemoryTokens(memoryFiles || getMemoryFiles(workingDir));
+    const tokens = messagesTokens + memoryTokens + SYSTEM_TOOLS_AND_SKILLS;
 
-    let tokens = 0;
-    if (usageIdx !== -1) {
-      tokens = keptEntries[usageIdx].usage.inputTokens;
-      const own = entryToContextMessages(keptEntries[usageIdx])[0];
-      if (own) tokens += estimateTokens3(own);
-      for (let i = usageIdx + 1; i < keptEntries.length; i++) {
-        for (const m of entryToContextMessages(keptEntries[i])) {
-          if (m && !m.meta?.isMeta) tokens += estimateTokens3(m);
-        }
-      }
-    } else {
-      tokens = estimateConversationTokens(keptEntries, stripIds) + SYSTEM_TOOLS_AND_SKILLS;
-    }
-
-    return { tokens, hasRealUsage: usageIdx !== -1, file: target.name, mtime: target.mtime };
+    return { tokens, file: target.name, mtime: target.mtime };
   } catch {}
   return null;
 }
@@ -532,7 +556,6 @@ try {
 export default function statusBarMod(cmd) {
   const authKey = getAuthKey();
   let diskCache = null;
-  let compactionOverride = null;
   let lastKnownLimit = 1000000;
   let lastMtime = 0;
   let activeModel = null;
@@ -624,12 +647,15 @@ export default function statusBarMod(cmd) {
 
       const liveSessionId = getLiveSessionId();
       const target = (liveSessionId && files.find(f => f.name === `${liveSessionId}.jsonl`)) || files[0];
-      if (diskCache && diskCache.file === target.name && diskCache.mtime === target.mtime) {
+      const memoryFiles = getMemoryFiles(workingDir);
+      const memorySig = getMemorySignature(memoryFiles);
+      if (diskCache && diskCache.file === target.name && diskCache.mtime === target.mtime &&
+          diskCache.memorySig === memorySig) {
         return diskCache.value;
       }
 
-      const value = getLatestContextUsage(workingDir, liveSessionId);
-      diskCache = { file: target.name, mtime: target.mtime, value };
+      const value = getLatestContextUsage(workingDir, liveSessionId, memoryFiles);
+      diskCache = { file: target.name, mtime: target.mtime, memorySig, value };
       return value;
     } catch {}
     return null;
@@ -637,29 +663,13 @@ export default function statusBarMod(cmd) {
 
   function getActiveContextUsage(workingDir) {
     const host = readHostContextUsage();
+    const limit = (host && host.limit) || lastKnownLimit;
+
     const disk = getDiskContextUsage(workingDir);
+    if (disk) return formatTokens(disk.tokens, limit);
 
-    // On a resumed session the host tracker has no remembered state and
-    // reports a message-only estimate, so trust the log's real API usage.
-    const diskReal = (disk && disk.hasRealUsage &&
-      (!compactionOverride || disk.mtime > compactionOverride.at)) ? disk.tokens : 0;
-    const hostTokens = host ? host.tokens : 0;
-    const maxTokens = Math.max(hostTokens, diskReal);
-
-    if (compactionOverride) {
-      const fresh = Date.now() - compactionOverride.at < 5000;
-      if (fresh || maxTokens < compactionOverride.tokens) {
-        return formatTokens(compactionOverride.tokens, compactionOverride.limit);
-      }
-      compactionOverride = null;
-    }
-
-    if (maxTokens > 0) return formatTokens(maxTokens, (host && host.limit) || lastKnownLimit);
-
-    if (disk) return formatTokens(disk.tokens, lastKnownLimit);
-    if (host) return formatTokens(host.tokens, host.limit);
-
-    return 'ctx 0k/1M · 0%';
+    const tokens = estimateMemoryTokens(getMemoryFiles(workingDir)) + SYSTEM_TOOLS_AND_SKILLS;
+    return formatTokens(tokens, limit);
   }
 
   function getModelDisplay() {
@@ -787,20 +797,8 @@ export default function statusBarMod(cmd) {
       }
     });
 
-    cmd.on('compaction_outcome', (evt) => {
+    cmd.on('compaction_outcome', () => {
       try {
-        if (evt && typeof evt.tokensAfter === 'number' && evt.tokensAfter > 0) {
-          const limit = (typeof evt.contextLimit === 'number' && evt.contextLimit > 0)
-            ? evt.contextLimit
-            : lastKnownLimit;
-          compactionOverride = {
-            tokens: evt.tokensAfter + SYSTEM_TOOLS_AND_SKILLS,
-            limit,
-            at: Date.now()
-          };
-        } else {
-          compactionOverride = null;
-        }
         diskCache = null;
         if (cmd.ui && typeof cmd.ui.refreshWidgets === 'function') {
           cmd.ui.refreshWidgets();
