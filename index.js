@@ -1,6 +1,7 @@
 import https from 'https';
 import fs from 'fs';
 import path from 'path';
+import { spawn } from 'child_process';
 
 function formatDuration(ms) {
   if (typeof ms !== 'number' || isNaN(ms) || ms <= 0) return '0m';
@@ -124,13 +125,8 @@ function cleanupInstance() {
   } catch {}
 }
 
-try {
-  process.on('exit', cleanupInstance);
-  process.on('SIGINT', cleanupInstance);
-  process.on('SIGTERM', cleanupInstance);
-} catch {}
-
 const TOKEN_CHAR_RATIO = 3.5;
+const JSON_RATIO = 1.1;
 const SYSTEM_TOOLS_AND_SKILLS = 17000;
 
 function estimateTextTokens(str) {
@@ -141,49 +137,84 @@ function estimateTextTokens(str) {
   return Math.max(0, Math.ceil(n - o));
 }
 
-function estimateMessageTokens(m) {
-  if (!m) return 0;
-  let tokens = 3;
-  const content = m.content;
-  if (typeof content === 'string') return tokens + estimateTextTokens(content);
-  if (Array.isArray(content)) {
-    for (const b of content) {
-      if (!b) continue;
-      if (b.type === 'text') {
-        tokens += estimateTextTokens(b.text || '');
-      } else if (b.type === 'tool_use' || b.type === 'tool-call') {
-        tokens += 5;
-        const name = b.name || b.toolName;
-        if (name) tokens += estimateTextTokens(name);
-        const input = b.input || b.arguments;
-        if (input) tokens += Math.ceil(estimateTextTokens(JSON.stringify(input)) * 1.1);
-      } else if (b.type === 'tool_result' || b.type === 'tool-result') {
-        tokens += 3;
-        let val = '';
-        if (typeof b.content === 'string') val = b.content;
-        else if (Array.isArray(b.content)) {
-          val = b.content.map(c => typeof c === 'string' ? c : (c.text || JSON.stringify(c))).join('\n');
-        } else if (b.output && typeof b.output === 'object' && b.output.value) {
-          val = b.output.value;
+function estimateTokens3(e) {
+  if (!e) return 0;
+  if (typeof e === 'string') {
+    let n = estimateTextTokens(e);
+    if (e.startsWith('{') || e.startsWith('[')) n = Math.ceil(n * JSON_RATIO);
+    return n;
+  }
+  let n = 3;
+  const content = e.content;
+  if (typeof content === 'string') {
+    n += estimateTextTokens(content);
+  } else if (Array.isArray(content)) {
+    for (const o of content) {
+      if (!o) continue;
+      if (o.type === 'text' && o.text) {
+        n += estimateTextTokens(o.text);
+      } else if (o.type === 'image') {
+        n += 1229;
+      } else if (o.type === 'tool-call' || o.type === 'tool_use') {
+        n += 5;
+        const name = o.toolName || o.name;
+        if (name) n += estimateTextTokens(name);
+        const inp = o.input || o.arguments;
+        if (inp) {
+          const s = typeof inp === 'string' ? inp : JSON.stringify(inp);
+          n += Math.ceil(estimateTextTokens(s) * JSON_RATIO);
         }
-        tokens += estimateTextTokens(val);
-      } else if (b.type === 'image') {
-        tokens += 1229;
+      } else if (o.type === 'tool-result' || o.type === 'tool_result') {
+        n += 3;
+        const out = o.output;
+        if (out && typeof out === 'object' && 'value' in out && typeof out.value === 'string') {
+          n += estimateTextTokens(out.value);
+        } else if (typeof o.content === 'string') {
+          n += estimateTextTokens(o.content);
+        } else if (Array.isArray(o.content)) {
+          for (const c of o.content) {
+            if (typeof c === 'string') n += estimateTextTokens(c);
+            else if (c && c.text) n += estimateTextTokens(c.text);
+            else if (c) n += estimateTextTokens(JSON.stringify(c));
+          }
+        }
       }
     }
   }
-  return Math.ceil(tokens);
+  return n;
 }
 
-function calculateConversationTokens(messages) {
-  if (!Array.isArray(messages) || messages.length === 0) return 0;
-  let total = SYSTEM_TOOLS_AND_SKILLS;
+function stripThinking(messages) {
+  const res = [];
   for (const m of messages) {
-    if (m && !m.meta?.isMeta) {
-      total += estimateMessageTokens(m);
+    if (!m) continue;
+    if (m.role !== 'assistant') {
+      res.push(m);
+      continue;
+    }
+    if (Array.isArray(m.content)) {
+      const filtered = m.content.filter(b => b && b.type !== 'thinking');
+      if (filtered.length > 0) {
+        res.push({ ...m, content: filtered });
+      }
+    } else {
+      res.push(m);
     }
   }
-  return total;
+  return res;
+}
+
+function entryToContextMessages(e) {
+  if (!e) return [];
+  if (e.type === 'message' && e.message) return [e.message];
+  if (e.type === 'compaction') {
+    return [{
+      role: 'user',
+      content: [{ type: 'text', text: e.summary || '' }],
+      meta: { isSummary: true, summaryEntryId: e.id }
+    }];
+  }
+  return [];
 }
 
 function getLatestContextUsage(workingDir = process.cwd()) {
@@ -242,8 +273,10 @@ function getLatestContextUsage(workingDir = process.cwd()) {
       }
     }
 
-    let contextEntries = pathEntries;
-    if (compactionIdx !== -1) {
+    let messages = [];
+    if (compactionIdx === -1) {
+      messages = pathEntries.flatMap(entryToContextMessages);
+    } else {
       const comp = pathEntries[compactionIdx];
       const kept = [comp];
       let foundFirst = false;
@@ -258,15 +291,23 @@ function getLatestContextUsage(workingDir = process.cwd()) {
       for (let i = compactionIdx + 1; i < pathEntries.length; i++) {
         kept.push(pathEntries[i]);
       }
-      contextEntries = kept;
+
+      const pathIdxMap = new Map(pathEntries.map((e, idx) => [e.id, idx]));
+      for (const e of kept) {
+        const msgs = entryToContextMessages(e);
+        const idx = pathIdxMap.get(e.id);
+        if (idx === undefined || idx >= compactionIdx) {
+          messages.push(...msgs);
+        } else {
+          messages.push(...stripThinking(msgs));
+        }
+      }
     }
 
     let conversationTokens = 0;
-    for (const entry of contextEntries) {
-      if (entry.type === 'message' && entry.message && !entry.message.meta?.isMeta) {
-        conversationTokens += estimateMessageTokens(entry.message);
-      } else if (entry.type === 'compaction' && entry.summary) {
-        conversationTokens += estimateTextTokens(entry.summary);
+    for (const m of messages) {
+      if (m && !m.meta?.isMeta) {
+        conversationTokens += estimateTokens3(m);
       }
     }
 
@@ -316,6 +357,83 @@ function getAuthKey() {
   } catch {}
   return null;
 }
+
+class StayAwakeManager {
+  constructor() {
+    this.proc = null;
+    this.activeRuns = 0;
+  }
+
+  acquire() {
+    this.activeRuns++;
+    if (this.proc) return;
+
+    try {
+      if (process.platform === 'win32') {
+        const psScript = `
+$def = @"
+[DllImport("kernel32.dll", SetLastError = true)]
+public static extern int SetThreadExecutionState(int esFlags);
+"@
+$w = Add-Type -MemberDefinition $def -Name "WinAwakeRunner" -Namespace "Win32" -PassThru
+$w::SetThreadExecutionState([int]0x80000003) | Out-Null
+while ($true) {
+  Start-Sleep -Seconds 30
+  $w::SetThreadExecutionState([int]0x80000003) | Out-Null
+}
+`;
+        this.proc = spawn('powershell.exe', ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', psScript], {
+          windowsHide: true,
+          stdio: 'ignore'
+        });
+        if (typeof this.proc.unref === 'function') this.proc.unref();
+      } else if (process.platform === 'darwin') {
+        this.proc = spawn('caffeinate', ['-d', '-i'], { stdio: 'ignore' });
+        if (typeof this.proc.unref === 'function') this.proc.unref();
+      } else if (process.platform === 'linux') {
+        this.proc = spawn('systemd-inhibit', ['--what=idle:sleep', '--why=CommandCode running', 'sleep', 'infinity'], { stdio: 'ignore' });
+        if (typeof this.proc.unref === 'function') this.proc.unref();
+      }
+    } catch {}
+  }
+
+  release() {
+    this.activeRuns = Math.max(0, this.activeRuns - 1);
+    if (this.activeRuns === 0 && this.proc) {
+      try {
+        this.proc.kill('SIGKILL');
+      } catch {}
+      this.proc = null;
+    }
+  }
+
+  forceRelease() {
+    this.activeRuns = 0;
+    if (this.proc) {
+      try {
+        this.proc.kill('SIGKILL');
+      } catch {}
+      this.proc = null;
+    }
+  }
+}
+
+const stayAwake = new StayAwakeManager();
+
+try {
+  process.on('exit', () => {
+    cleanupInstance();
+    stayAwake.forceRelease();
+  });
+  process.on('SIGINT', () => {
+    cleanupInstance();
+    stayAwake.forceRelease();
+  });
+  process.on('SIGTERM', () => {
+    cleanupInstance();
+    stayAwake.forceRelease();
+  });
+} catch {}
 
 export default function statusBarMod(cmd) {
   const authKey = getAuthKey();
@@ -381,7 +499,10 @@ export default function statusBarMod(cmd) {
   function getActiveContextUsage(workingDir) {
     if (cachedCtx) return cachedCtx;
     const fromDisk = getLatestContextUsage(workingDir);
-    if (fromDisk) return fromDisk;
+    if (fromDisk) {
+      cachedCtx = fromDisk;
+      return fromDisk;
+    }
     if (typeof cmd.getContextUsage === 'function') {
       try {
         const cu = cmd.getContextUsage();
@@ -447,6 +568,7 @@ export default function statusBarMod(cmd) {
   }
 
   function teardown() {
+    stayAwake.forceRelease();
     if (checkTimer) clearInterval(checkTimer);
     if (billingTimer) clearInterval(billingTimer);
     cleanupInstance();
@@ -501,6 +623,27 @@ export default function statusBarMod(cmd) {
   refreshUsage();
 
   if (typeof cmd.on === 'function') {
+    cmd.on('run_start', () => {
+      stayAwake.acquire();
+      applyTabTitle();
+    });
+
+    cmd.on('turn_start', () => {
+      stayAwake.acquire();
+      applyTabTitle();
+    });
+
+    cmd.on('turn_end', () => {
+      pollContextAndTitle();
+    });
+
+    cmd.on('run_end', () => {
+      stayAwake.release();
+      applyTabTitle();
+      pollContextAndTitle();
+      refreshUsage();
+    });
+
     cmd.on('model_request_start', (evt) => {
       if (evt && evt.model) {
         activeModel = evt.model;
@@ -548,46 +691,5 @@ export default function statusBarMod(cmd) {
     billingTimer = setInterval(refreshUsage, 45000);
     if (typeof checkTimer.unref === 'function') checkTimer.unref();
     if (typeof billingTimer.unref === 'function') billingTimer.unref();
-  }
-
-  if (typeof cmd.hooks === 'function') {
-    cmd.hooks({
-      onTurnStart(payload) {
-        try {
-          applyTabTitle();
-          if (payload && payload.state && Array.isArray(payload.state.messages)) {
-            const tokens = calculateConversationTokens(payload.state.messages);
-            if (tokens > 0) {
-              cachedCtx = formatTokens(tokens, 1000000);
-              if (cmd.ui && typeof cmd.ui.refreshWidgets === 'function') {
-                cmd.ui.refreshWidgets();
-              }
-            }
-          }
-        } catch {}
-        return (payload && payload.state !== undefined) ? payload.state : payload;
-      },
-      onTurnEnd(payload) {
-        try {
-          applyTabTitle();
-          if (payload && payload.state && Array.isArray(payload.state.messages)) {
-            const tokens = calculateConversationTokens(payload.state.messages);
-            if (tokens > 0) {
-              cachedCtx = formatTokens(tokens, 1000000);
-            }
-          }
-          if (cmd.ui && typeof cmd.ui.refreshWidgets === 'function') {
-            cmd.ui.refreshWidgets();
-          }
-        } catch {}
-        return (payload && payload.state !== undefined) ? payload.state : payload;
-      },
-      onRunEnd() {
-        try {
-          applyTabTitle();
-          refreshUsage();
-        } catch {}
-      }
-    });
   }
 }

@@ -1,18 +1,19 @@
 {
   "name": "cmd-mod-status-bar",
-  "version": "1.0.2",
-  "description": "Clean responsive status bar footer with live limits, compaction-aware context, and workspace tab titling for Command Code",
+  "version": "1.0.3",
+  "description": "Clean responsive status bar footer with live limits, compaction-aware context, workspace tab titling, and screen keep-awake for Command Code",
   "main": "index.js",
   "type": "module",
   "keywords": [
     "command-code-mod",
     "cmd-mod",
     "cmd-mod-widget",
-    "cmd-mod-hook",
     "statusline",
     "footer",
     "status-bar",
-    "terminal-title"
+    "terminal-title",
+    "keep-awake",
+    "screen-sleep"
   ],
   "author": {
     "name": "Sandeep Khadka",

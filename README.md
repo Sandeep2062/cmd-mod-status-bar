@@ -1,6 +1,6 @@
 # cmd-mod-status-bar
 
-Status bar footer with live limits, compaction-aware context, and workspace tab titling for [Command Code](https://commandcode.ai).
+Status bar footer with live limits, compaction-aware context, workspace tab titling, and screen keep-awake for [Command Code](https://commandcode.ai).
 
 ```text
 PixVault (main) · deepseek-v4.1-flash (high) · ctx 95k/1M · 9% · 5h: 1% (4h 47m) · wk: 10% (6d 3h)
@@ -9,11 +9,13 @@ PixVault (main) · deepseek-v4.1-flash (high) · ctx 95k/1M · 9% · 5h: 1% (4h 
 ## Features
 
 - **Rolling Limits**: Displays 5-hour and weekly usage percentages and reset countdowns fetched directly from the Command Code billing API.
-- **Compaction-Aware Context**: Tracks active token usage against context limits, automatically accounting for `/compact` reductions without stale token counts.
+- **Compaction-Aware Context**: Accurately tracks active conversation token usage matching Command Code's `/context` inspector, stripping thinking blocks after `/compact` and maintaining accurate token tallies.
 - **Dynamic Model Tracking**: Automatically displays current active model and reasoning effort.
+- **Screen & Laptop Keep-Awake**: Automatically prevents your laptop from sleeping and keeps the screen awake while Command Code is actively running or thinking (using native Windows `SetThreadExecutionState`, macOS `caffeinate`, or Linux `systemd-inhibit`), cleanly releasing sleep locks when idle.
 - **Workspace Tab Titling**: Sets terminal tab titles to the workspace git repository name, with sequential numbering for duplicate sessions (`PixVault`, `PixVault (2)`). Dead session PIDs are automatically cleaned up on exit.
+- **Pure Observer Pattern**: Uses safe `cmd.on` lifecycle events with zero state mutations or risky hooks.
 - **Responsive Layout**: Renders on a single line on wide terminals, cleanly wrapping to two lines on split screens without text clipping.
-- **Zero Dependencies**: Pure standard Node.js runtime (`https`, `fs`, `path`).
+- **Zero Dependencies**: Pure standard Node.js runtime (`https`, `fs`, `path`, `child_process`).
 
 ## Installation
 
@@ -53,25 +55,6 @@ Inspect registered hooks and capabilities:
 
 ```bash
 cmd mods inspect cmd-mod-status-bar
-```
-
-## Mods Hub Registry Entry
-
-To register in `CommandCodeAI/command-code` under `mods/registry.json`:
-
-```json
-{
-  "name": "status-bar",
-  "source": "Sandeep2062/cmd-mod-status-bar",
-  "description": "Responsive status bar footer with live limits, compaction-aware context, and workspace tab titling.",
-  "author": {
-    "name": "Sandeep Khadka",
-    "github": "Sandeep2062"
-  },
-  "repo": "https://github.com/Sandeep2062/cmd-mod-status-bar",
-  "kinds": ["hook"],
-  "tags": ["status-bar", "footer", "usage", "context", "tabs"]
-}
 ```
 
 ## License
