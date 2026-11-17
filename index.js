@@ -217,31 +217,143 @@ function entryToContextMessages(e) {
   return [];
 }
 
-function getLatestContextUsage(workingDir = process.cwd()) {
-  try {
-    const home = process.env.USERPROFILE || process.env.HOME || '';
-    const norm = path.resolve(workingDir);
-    let dirName = '';
-    if (process.platform === 'win32') {
-      const drive = norm.charAt(0).toLowerCase();
-      const slug = norm.replace(/^[a-zA-Z]:[\\/]/, '').replace(/[\\/]/g, '-').toLowerCase();
-      dirName = `${drive}-${slug}`;
-    } else {
-      dirName = norm.replace(/^\//, '').replace(/\//g, '-').toLowerCase();
-    }
+const storeDirCache = new Map();
 
-    const projectStore = path.join(home, '.commandcode', 'projects', dirName);
+function hostProjectDirName(projectPath) {
+  const decamelized = projectPath
+    .replace(/([A-Z]{2,})(\d+)/g, '$1 $2')
+    .replace(/([a-z\d]+)([A-Z]{2,})/g, '$1 $2')
+    .replace(/([a-z\d])([A-Z])/g, '$1 $2')
+    .replace(/([A-Z]+)([A-Z][a-rt-z\d]+)/g, '$1 $2');
+  return decamelized
+    .toLowerCase()
+    .replace(/[^a-z\d]+/g, '-')
+    .replace(/-{2,}/g, '-')
+    .replace(/^-+|-+$/g, '') || 'root';
+}
+
+function findStoreDirByCwd(baseDir, targetCwd) {
+  let names;
+  try {
+    names = fs.readdirSync(baseDir, { withFileTypes: true })
+      .filter(d => d.isDirectory())
+      .map(d => d.name);
+  } catch {
+    return null;
+  }
+
+  const target = targetCwd.toLowerCase();
+  for (const name of names) {
+    const dir = path.join(baseDir, name);
+    let files;
+    try {
+      files = fs.readdirSync(dir).filter(f => f.endsWith('.jsonl') && !f.includes('checkpoint'));
+    } catch {
+      continue;
+    }
+    for (const file of files.slice(0, 2)) {
+      let fd;
+      try {
+        const filePath = path.join(dir, file);
+        fd = fs.openSync(filePath, 'r');
+        const buf = Buffer.alloc(2048);
+        const read = fs.readSync(fd, buf, 0, buf.length, 0);
+        const firstLine = buf.toString('utf8', 0, read).split('\n', 1)[0];
+        const head = JSON.parse(firstLine);
+        if (head && head.type === 'session' && typeof head.cwd === 'string' &&
+            path.resolve(head.cwd).toLowerCase() === target) {
+          return dir;
+        }
+      } catch {} finally {
+        if (fd !== undefined) {
+          try { fs.closeSync(fd); } catch {}
+        }
+      }
+    }
+  }
+  return null;
+}
+
+function getProjectStoreDir(workingDir) {
+  const home = process.env.USERPROFILE || process.env.HOME || '';
+  const baseDir = path.join(home, '.commandcode', 'projects');
+  const norm = path.resolve(workingDir);
+  const cacheKey = norm.toLowerCase();
+  const now = Date.now();
+
+  const cached = storeDirCache.get(cacheKey);
+  if (cached && (cached.dir || now - cached.at < 30000)) {
+    return cached.dir || path.join(baseDir, hostProjectDirName(norm));
+  }
+
+  const expected = path.join(baseDir, hostProjectDirName(norm));
+  const dir = fs.existsSync(expected) ? expected : findStoreDirByCwd(baseDir, norm);
+  storeDirCache.set(cacheKey, { dir, at: now });
+  return dir || expected;
+}
+
+function listSessionFiles(projectStore) {
+  return fs.readdirSync(projectStore)
+    .filter(f => f.endsWith('.jsonl') && !f.includes('checkpoint'))
+    .map(f => {
+      const filePath = path.join(projectStore, f);
+      return { name: f, path: filePath, mtime: fs.statSync(filePath).mtimeMs };
+    })
+    .sort((a, b) => b.mtime - a.mtime);
+}
+
+function reconstructContextEntries(pathEntries) {
+  let compactionIdx = -1;
+  for (let i = pathEntries.length - 1; i >= 0; i--) {
+    if (pathEntries[i].type === 'compaction') {
+      compactionIdx = i;
+      break;
+    }
+  }
+
+  if (compactionIdx === -1) {
+    return { compactionIdx, keptEntries: pathEntries, stripIds: null };
+  }
+
+  const comp = pathEntries[compactionIdx];
+  const keptEntries = [comp];
+  let foundFirst = false;
+  for (let i = 0; i < compactionIdx; i++) {
+    const e = pathEntries[i];
+    if (!foundFirst) {
+      if (e.id !== comp.firstKeptEntryId) continue;
+      foundFirst = true;
+    }
+    keptEntries.push(e);
+  }
+  for (let i = compactionIdx + 1; i < pathEntries.length; i++) keptEntries.push(pathEntries[i]);
+
+  const stripIds = new Set(pathEntries.slice(0, compactionIdx).map(e => e.id));
+  return { compactionIdx, keptEntries, stripIds };
+}
+
+function estimateConversationTokens(keptEntries, stripIds) {
+  let tokens = 0;
+  for (const e of keptEntries) {
+    let msgs = entryToContextMessages(e);
+    if (stripIds && stripIds.has(e.id)) msgs = stripThinking(msgs);
+    for (const m of msgs) {
+      if (m && !m.meta?.isMeta) tokens += estimateTokens3(m);
+    }
+  }
+  return tokens;
+}
+
+function getLatestContextUsage(workingDir = process.cwd(), liveSessionId = null) {
+  try {
+    const projectStore = getProjectStoreDir(workingDir);
     if (!fs.existsSync(projectStore)) return null;
 
-    const files = fs.readdirSync(projectStore)
-      .filter(f => f.endsWith('.jsonl') && !f.includes('checkpoint'))
-      .map(f => ({ name: f, mtime: fs.statSync(path.join(projectStore, f)).mtimeMs }))
-      .sort((a, b) => b.mtime - a.mtime);
-
+    const files = listSessionFiles(projectStore);
     if (files.length === 0) return null;
-    const latestJsonl = path.join(projectStore, files[0].name);
 
-    const lines = fs.readFileSync(latestJsonl, 'utf8').trim().split('\n');
+    const target = (liveSessionId && files.find(f => f.name === `${liveSessionId}.jsonl`)) || files[0];
+    const lines = fs.readFileSync(target.path, 'utf8').trim().split('\n');
     if (lines.length === 0) return null;
 
     const entries = [];
@@ -265,54 +377,34 @@ function getLatestContextUsage(workingDir = process.cwd()) {
     }
     pathEntries.reverse();
 
-    let compactionIdx = -1;
-    for (let i = pathEntries.length - 1; i >= 0; i--) {
-      if (pathEntries[i].type === 'compaction') {
-        compactionIdx = i;
+    const { compactionIdx, keptEntries, stripIds } = reconstructContextEntries(pathEntries);
+
+    // Real API usage already accounts for system prompt, memory files, tools,
+    // and MCP schemas, which a pure message-character estimate cannot see.
+    let usageIdx = -1;
+    for (let i = keptEntries.length - 1; i >= 0; i--) {
+      const usage = keptEntries[i].usage;
+      if (usage && typeof usage.inputTokens === 'number' && usage.inputTokens > 0) {
+        usageIdx = i;
         break;
       }
     }
 
-    let messages = [];
-    if (compactionIdx === -1) {
-      messages = pathEntries.flatMap(entryToContextMessages);
+    let tokens = 0;
+    if (usageIdx !== -1) {
+      tokens = keptEntries[usageIdx].usage.inputTokens;
+      const own = entryToContextMessages(keptEntries[usageIdx])[0];
+      if (own) tokens += estimateTokens3(own);
+      for (let i = usageIdx + 1; i < keptEntries.length; i++) {
+        for (const m of entryToContextMessages(keptEntries[i])) {
+          if (m && !m.meta?.isMeta) tokens += estimateTokens3(m);
+        }
+      }
     } else {
-      const comp = pathEntries[compactionIdx];
-      const kept = [comp];
-      let foundFirst = false;
-      for (let i = 0; i < compactionIdx; i++) {
-        const e = pathEntries[i];
-        if (!foundFirst) {
-          if (e.id !== comp.firstKeptEntryId) continue;
-          foundFirst = true;
-        }
-        kept.push(e);
-      }
-      for (let i = compactionIdx + 1; i < pathEntries.length; i++) {
-        kept.push(pathEntries[i]);
-      }
-
-      const pathIdxMap = new Map(pathEntries.map((e, idx) => [e.id, idx]));
-      for (const e of kept) {
-        const msgs = entryToContextMessages(e);
-        const idx = pathIdxMap.get(e.id);
-        if (idx === undefined || idx >= compactionIdx) {
-          messages.push(...msgs);
-        } else {
-          messages.push(...stripThinking(msgs));
-        }
-      }
+      tokens = estimateConversationTokens(keptEntries, stripIds) + SYSTEM_TOOLS_AND_SKILLS;
     }
 
-    let conversationTokens = 0;
-    for (const m of messages) {
-      if (m && !m.meta?.isMeta) {
-        conversationTokens += estimateTokens3(m);
-      }
-    }
-
-    const totalTokens = conversationTokens + SYSTEM_TOOLS_AND_SKILLS;
-    return formatTokens(totalTokens, 1000000);
+    return { tokens, file: target.name, mtime: target.mtime };
   } catch {}
   return null;
 }
@@ -437,7 +529,9 @@ try {
 
 export default function statusBarMod(cmd) {
   const authKey = getAuthKey();
-  let cachedCtx = null;
+  let diskCache = null;
+  let compactionOverride = null;
+  let lastKnownLimit = 1000000;
   let lastMtime = 0;
   let activeModel = null;
   let checkTimer = null;
@@ -496,21 +590,67 @@ export default function statusBarMod(cmd) {
     }
   }
 
+  function getLiveSessionId() {
+    try {
+      const session = cmd.session;
+      if (session && typeof session.id === 'string' && session.id) return session.id;
+    } catch {}
+    return null;
+  }
+
+  function readHostContextUsage() {
+    try {
+      if (typeof cmd.getContextUsage !== 'function') return null;
+      const cu = cmd.getContextUsage();
+      if (!cu) return null;
+      const limit = (typeof cu.contextWindow === 'number' && cu.contextWindow > 0)
+        ? cu.contextWindow
+        : (typeof cu.contextLimit === 'number' && cu.contextLimit > 0 ? cu.contextLimit : null);
+      if (limit) lastKnownLimit = limit;
+      if (typeof cu.tokens !== 'number' || cu.tokens <= 0) return null;
+      return { tokens: cu.tokens, limit: limit || lastKnownLimit };
+    } catch {}
+    return null;
+  }
+
+  function getDiskContextUsage(workingDir) {
+    try {
+      const projectStore = getProjectStoreDir(workingDir);
+      if (!fs.existsSync(projectStore)) return null;
+      const files = listSessionFiles(projectStore);
+      if (files.length === 0) return null;
+
+      const liveSessionId = getLiveSessionId();
+      const target = (liveSessionId && files.find(f => f.name === `${liveSessionId}.jsonl`)) || files[0];
+      if (diskCache && diskCache.file === target.name && diskCache.mtime === target.mtime) {
+        return diskCache.value;
+      }
+
+      const value = getLatestContextUsage(workingDir, liveSessionId);
+      diskCache = { file: target.name, mtime: target.mtime, value };
+      return value;
+    } catch {}
+    return null;
+  }
+
   function getActiveContextUsage(workingDir) {
-    if (cachedCtx) return cachedCtx;
-    const fromDisk = getLatestContextUsage(workingDir);
-    if (fromDisk) {
-      cachedCtx = fromDisk;
-      return fromDisk;
+    const host = readHostContextUsage();
+
+    if (compactionOverride && Date.now() - compactionOverride.at > 60000) {
+      compactionOverride = null;
     }
-    if (typeof cmd.getContextUsage === 'function') {
-      try {
-        const cu = cmd.getContextUsage();
-        if (cu && typeof cu.tokens === 'number' && cu.tokens > 0) {
-          return formatTokens(cu.tokens, cu.contextWindow || 1000000);
-        }
-      } catch {}
+    // After a compaction the host tracker still reports the pre-compaction
+    // basis for a moment, so keep the event value until the host catches up.
+    if (compactionOverride && (!host || host.tokens < compactionOverride.tokens)) {
+      return formatTokens(compactionOverride.tokens, compactionOverride.limit);
     }
+    compactionOverride = null;
+
+    if (host) return formatTokens(host.tokens, host.limit);
+
+    const disk = getDiskContextUsage(workingDir);
+    if (disk) return formatTokens(disk.tokens, lastKnownLimit);
+
     return 'ctx 0k/1M · 0%';
   }
 
@@ -538,27 +678,12 @@ export default function statusBarMod(cmd) {
     try {
       applyTabTitle();
       const workingDir = cmd.cwd || process.cwd();
-      const home = process.env.USERPROFILE || process.env.HOME || '';
-      const norm = path.resolve(workingDir);
-      let dirName = '';
-      if (process.platform === 'win32') {
-        const drive = norm.charAt(0).toLowerCase();
-        const slug = norm.replace(/^[a-zA-Z]:[\\/]/, '').replace(/[\\/]/g, '-').toLowerCase();
-        dirName = `${drive}-${slug}`;
-      } else {
-        dirName = norm.replace(/^\//, '').replace(/\//g, '-').toLowerCase();
-      }
-
-      const projectStore = path.join(home, '.commandcode', 'projects', dirName);
+      const projectStore = getProjectStoreDir(workingDir);
       if (fs.existsSync(projectStore)) {
-        const files = fs.readdirSync(projectStore)
-          .filter(f => f.endsWith('.jsonl') && !f.includes('checkpoint'))
-          .map(f => ({ name: f, mtime: fs.statSync(path.join(projectStore, f)).mtimeMs }))
-          .sort((a, b) => b.mtime - a.mtime);
-
+        const files = listSessionFiles(projectStore);
         if (files.length > 0 && files[0].mtime !== lastMtime) {
           lastMtime = files[0].mtime;
-          cachedCtx = getLatestContextUsage(workingDir);
+          diskCache = null;
           if (cmd.ui && typeof cmd.ui.refreshWidgets === 'function') {
             cmd.ui.refreshWidgets();
           }
@@ -656,10 +781,18 @@ export default function statusBarMod(cmd) {
     cmd.on('compaction_outcome', (evt) => {
       try {
         if (evt && typeof evt.tokensAfter === 'number' && evt.tokensAfter > 0) {
-          cachedCtx = formatTokens(evt.tokensAfter + SYSTEM_TOOLS_AND_SKILLS, evt.contextLimit || 1000000);
+          const limit = (typeof evt.contextLimit === 'number' && evt.contextLimit > 0)
+            ? evt.contextLimit
+            : lastKnownLimit;
+          compactionOverride = {
+            tokens: evt.tokensAfter + SYSTEM_TOOLS_AND_SKILLS,
+            limit,
+            at: Date.now()
+          };
         } else {
-          cachedCtx = null;
+          compactionOverride = null;
         }
+        diskCache = null;
         if (cmd.ui && typeof cmd.ui.refreshWidgets === 'function') {
           cmd.ui.refreshWidgets();
         }
@@ -668,7 +801,7 @@ export default function statusBarMod(cmd) {
 
     cmd.on('compaction_done', () => {
       try {
-        cachedCtx = null;
+        diskCache = null;
         pollContextAndTitle();
       } catch {}
     });
