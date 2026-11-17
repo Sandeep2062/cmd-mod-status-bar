@@ -17,14 +17,23 @@ function formatDuration(ms) {
   return `${mins}m`;
 }
 
+function formatContextTokenCount(e) {
+  if (typeof e !== 'number' || isNaN(e) || e <= 0) return '0k';
+  if (e < 1000) return String(e);
+  if (e >= 1000000) {
+    const n = Math.round(e / 100000) / 10;
+    return Number.isInteger(n) ? `${n.toFixed(0)}M` : `${n.toFixed(1)}M`;
+  }
+  const n = Math.round(e / 100) / 10;
+  return Number.isInteger(n) ? `${n.toFixed(0)}k` : `${n.toFixed(1)}k`;
+}
+
 function formatTokens(tokens, limit = 1000000) {
   if (typeof tokens !== 'number' || isNaN(tokens) || tokens <= 0) return 'ctx 0k/1M · 0%';
-  const kTokens = tokens >= 1000000
-    ? (tokens / 1000000).toFixed(1) + 'M'
-    : (tokens >= 10000 ? Math.round(tokens / 1000) + 'k' : (tokens / 1000).toFixed(1) + 'k');
+  const kTokens = formatContextTokenCount(tokens);
   const maxLimit = (typeof limit === 'number' && limit > 0) ? limit : 1000000;
   const pct = Math.round((tokens / maxLimit) * 100);
-  const limitStr = maxLimit >= 1000000 ? `${Math.round(maxLimit / 1000000)}M` : `${Math.round(maxLimit / 1000)}k`;
+  const limitStr = formatContextTokenCount(maxLimit);
   return `ctx ${kTokens}/${limitStr} · ${pct}%`;
 }
 
@@ -204,46 +213,65 @@ function getLatestContextUsage(workingDir = process.cwd()) {
     const lines = fs.readFileSync(latestJsonl, 'utf8').trim().split('\n');
     if (lines.length === 0) return null;
 
-    let lastCompactionIdx = -1;
-    for (let i = lines.length - 1; i >= 0; i--) {
+    const entries = [];
+    for (const line of lines) {
       try {
-        const obj = JSON.parse(lines[i]);
-        if (obj.type === 'compaction') {
-          lastCompactionIdx = i;
-          break;
-        }
+        entries.push(JSON.parse(line));
       } catch {}
     }
+    if (entries.length === 0) return null;
 
-    const startIdx = lastCompactionIdx !== -1 ? lastCompactionIdx : 0;
+    const entriesMap = new Map(entries.map(e => [e.id, e]));
+    const lastId = entries[entries.length - 1].id;
+
+    const pathEntries = [];
+    const seen = new Set();
+    let curr = entriesMap.get(lastId);
+    while (curr && !seen.has(curr.id)) {
+      seen.add(curr.id);
+      pathEntries.push(curr);
+      curr = curr.parentId ? entriesMap.get(curr.parentId) : undefined;
+    }
+    pathEntries.reverse();
+
+    let compactionIdx = -1;
+    for (let i = pathEntries.length - 1; i >= 0; i--) {
+      if (pathEntries[i].type === 'compaction') {
+        compactionIdx = i;
+        break;
+      }
+    }
+
+    let contextEntries = pathEntries;
+    if (compactionIdx !== -1) {
+      const comp = pathEntries[compactionIdx];
+      const kept = [comp];
+      let foundFirst = false;
+      for (let i = 0; i < compactionIdx; i++) {
+        const e = pathEntries[i];
+        if (!foundFirst) {
+          if (e.id !== comp.firstKeptEntryId) continue;
+          foundFirst = true;
+        }
+        kept.push(e);
+      }
+      for (let i = compactionIdx + 1; i < pathEntries.length; i++) {
+        kept.push(pathEntries[i]);
+      }
+      contextEntries = kept;
+    }
+
     let conversationTokens = 0;
-    let latestPostCompactionApiTokens = 0;
-
-    if (lastCompactionIdx !== -1) {
-      try {
-        const comp = JSON.parse(lines[lastCompactionIdx]);
-        if (comp.summary) {
-          conversationTokens += estimateTextTokens(comp.summary);
-        }
-      } catch {}
+    for (const entry of contextEntries) {
+      if (entry.type === 'message' && entry.message && !entry.message.meta?.isMeta) {
+        conversationTokens += estimateMessageTokens(entry.message);
+      } else if (entry.type === 'compaction' && entry.summary) {
+        conversationTokens += estimateTextTokens(entry.summary);
+      }
     }
 
-    for (let i = startIdx + 1; i < lines.length; i++) {
-      try {
-        const obj = JSON.parse(lines[i]);
-        if (obj.type === 'message' && obj.message && !obj.message.meta?.isMeta) {
-          conversationTokens += estimateMessageTokens(obj.message);
-        }
-        if (obj.usage && typeof obj.usage.inputTokens === 'number') {
-          latestPostCompactionApiTokens = obj.usage.inputTokens;
-        }
-      } catch {}
-    }
-
-    const estimatedTotal = conversationTokens + SYSTEM_TOOLS_AND_SKILLS;
-    const finalTokens = Math.max(estimatedTotal, latestPostCompactionApiTokens);
-
-    return formatTokens(finalTokens, 1000000);
+    const totalTokens = conversationTokens + SYSTEM_TOOLS_AND_SKILLS;
+    return formatTokens(totalTokens, 1000000);
   } catch {}
   return null;
 }
@@ -351,6 +379,9 @@ export default function statusBarMod(cmd) {
   }
 
   function getActiveContextUsage(workingDir) {
+    if (cachedCtx) return cachedCtx;
+    const fromDisk = getLatestContextUsage(workingDir);
+    if (fromDisk) return fromDisk;
     if (typeof cmd.getContextUsage === 'function') {
       try {
         const cu = cmd.getContextUsage();
@@ -359,8 +390,7 @@ export default function statusBarMod(cmd) {
         }
       } catch {}
     }
-    if (cachedCtx) return cachedCtx;
-    return getLatestContextUsage(workingDir) || 'ctx 0k/1M · 0%';
+    return 'ctx 0k/1M · 0%';
   }
 
   function getModelDisplay() {
@@ -542,13 +572,9 @@ export default function statusBarMod(cmd) {
           applyTabTitle();
           if (payload && payload.state && Array.isArray(payload.state.messages)) {
             const tokens = calculateConversationTokens(payload.state.messages);
-            const usageTokens = (payload.usage && typeof payload.usage.inputTokens === 'number') ? payload.usage.inputTokens : 0;
-            const finalTokens = Math.max(tokens, usageTokens);
-            if (finalTokens > 0) {
-              cachedCtx = formatTokens(finalTokens, 1000000);
+            if (tokens > 0) {
+              cachedCtx = formatTokens(tokens, 1000000);
             }
-          } else if (payload && payload.usage && typeof payload.usage.inputTokens === 'number') {
-            cachedCtx = formatTokens(payload.usage.inputTokens, 1000000);
           }
           if (cmd.ui && typeof cmd.ui.refreshWidgets === 'function') {
             cmd.ui.refreshWidgets();
