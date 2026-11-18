@@ -9,7 +9,7 @@ PixVault (main) · deepseek-v4.1-flash (high) · ctx 95k/1M · 9% · 5h: 1% (4h 
 ## Features
 
 - **Rolling Limits**: Displays 5-hour and weekly usage percentages and reset countdowns fetched directly from the Command Code billing API.
-- **Accurate Context Tracking**: Mirrors Command Code's `/context` breakdown — estimated conversation messages, memory files (`AGENTS.md` layers), built-in tools, and loaded skills. Compaction-aware reconstruction keeps the estimate correct on resumed sessions and after `/compact`.
+- **Accurate Context Tracking**: Mirrors Command Code's `/context` breakdown — estimated conversation messages, memory files (`AGENTS.md` layers), built-in tools, and loaded skills. Messages are normalized exactly like the harness: tool results keep only their text, images are sized by dimensions, so embedded screenshots never inflate the count. Compaction-aware reconstruction keeps the estimate correct on resumed sessions and after `/compact`.
 - **Dynamic Model Tracking**: Automatically displays current active model and reasoning effort.
 - **Screen & Laptop Keep-Awake**: Automatically prevents your laptop from sleeping and keeps the screen awake while Command Code is actively running or thinking (using native Windows `SetThreadExecutionState`, macOS `caffeinate`, or Linux `systemd-inhibit`), cleanly releasing sleep locks when idle.
 - **Workspace Tab Titling**: Sets terminal tab titles to the workspace git repository name, with sequential numbering for duplicate sessions (`PixVault`, `PixVault (2)`). Dead session PIDs are automatically cleaned up on exit.

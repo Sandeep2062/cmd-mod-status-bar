@@ -141,6 +141,24 @@ function estimateTextTokens(str) {
   return Math.max(0, Math.ceil(n - o));
 }
 
+function estimateImageTokens(source) {
+  try {
+    if (!source) return 1229;
+    const buf = Buffer.from(String(source), 'base64');
+    if (buf.subarray(0, 8).toString('hex') === '89504e470d0a1a0a') {
+      return Math.ceil((buf.readUInt32BE(16) * buf.readUInt32BE(20)) / 750);
+    }
+    if (buf[0] === 0xff && buf[1] === 0xd8) {
+      for (let i = 2; i < buf.length - 10; i++) {
+        if (buf[i] === 0xff && (buf[i + 1] === 0xc0 || buf[i + 1] === 0xc2)) {
+          return Math.ceil((buf.readUInt16BE(i + 7) * buf.readUInt16BE(i + 5)) / 750);
+        }
+      }
+    }
+  } catch {}
+  return 1229;
+}
+
 function estimateTokens3(e) {
   if (!e) return 0;
   if (typeof e === 'string') {
@@ -148,44 +166,69 @@ function estimateTokens3(e) {
     if (e.startsWith('{') || e.startsWith('[')) n = Math.ceil(n * JSON_RATIO);
     return n;
   }
-  let n = 3;
-  const content = e.content;
-  if (typeof content === 'string') {
-    n += estimateTextTokens(content);
-  } else if (Array.isArray(content)) {
-    for (const o of content) {
-      if (!o) continue;
-      if (o.type === 'text' && o.text) {
-        n += estimateTextTokens(o.text);
-      } else if (o.type === 'image') {
-        n += 1229;
-      } else if (o.type === 'tool-call' || o.type === 'tool_use') {
+  return estimateMessageForContext(e);
+}
+
+// Mirrors Command Code's toV2 + estimateTokens3: tool results keep only their
+// text (images inside them are dropped before estimation) and top-level images
+// are sized by their dimensions rather than by base64 length.
+function estimateMessageForContext(m) {
+  if (!m) return 0;
+  const content = typeof m.content === 'string'
+    ? [{ type: 'text', text: m.content }]
+    : (Array.isArray(m.content) ? m.content : []);
+  let n = 0;
+
+  if (m.role === 'assistant') {
+    n = 3;
+    for (const b of content) {
+      if (!b) continue;
+      if (b.type === 'text' && typeof b.text === 'string') {
+        n += estimateTextTokens(b.text);
+      } else if (b.type === 'tool-call' || b.type === 'tool_use') {
         n += 5;
-        const name = o.toolName || o.name;
+        const name = b.toolName || b.name;
         if (name) n += estimateTextTokens(name);
-        const inp = o.input || o.arguments;
-        if (inp) {
-          const s = typeof inp === 'string' ? inp : JSON.stringify(inp);
-          n += Math.ceil(estimateTextTokens(s) * JSON_RATIO);
-        }
-      } else if (o.type === 'tool-result' || o.type === 'tool_result') {
-        n += 3;
-        const out = o.output;
-        if (out && typeof out === 'object' && 'value' in out && typeof out.value === 'string') {
-          n += estimateTextTokens(out.value);
-        } else if (typeof o.content === 'string') {
-          n += estimateTextTokens(o.content);
-        } else if (Array.isArray(o.content)) {
-          for (const c of o.content) {
-            if (typeof c === 'string') n += estimateTextTokens(c);
-            else if (c && c.text) n += estimateTextTokens(c.text);
-            else if (c) n += estimateTextTokens(JSON.stringify(c));
-          }
-        }
+        const input = b.input || b.arguments;
+        if (input) n += Math.ceil(estimateTextTokens(JSON.stringify(input)) * JSON_RATIO);
       }
     }
+    return Math.ceil(n);
   }
-  return n;
+
+  let hasTool = false;
+  let hasUser = false;
+  for (const b of content) {
+    if (!b) continue;
+    if (b.type === 'tool-result' || b.type === 'tool_result') {
+      hasTool = true;
+      n += 3;
+      const out = b.output;
+      if (out && typeof out === 'object' && typeof out.value === 'string') {
+        n += estimateTextTokens(out.value);
+      } else if (typeof b.content === 'string') {
+        n += estimateTextTokens(b.content);
+      } else if (Array.isArray(b.content)) {
+        let text = '';
+        for (const c of b.content) {
+          if (c && c.type === 'text' && typeof c.text === 'string') {
+            text += (text ? '\n' : '') + c.text;
+          }
+        }
+        n += estimateTextTokens(text);
+      }
+    } else if (b.type === 'text' && typeof b.text === 'string') {
+      hasUser = true;
+      n += estimateTextTokens(b.text);
+    } else if (b.type === 'image') {
+      hasUser = true;
+      const src = b.image || (b.source && b.source.data) || '';
+      n += estimateImageTokens(String(src).replace(/^data:[^;]+;base64,/, ''));
+    }
+  }
+  if (hasTool) n += 3;
+  if (hasUser) n += 3;
+  return Math.ceil(n);
 }
 
 function stripThinking(messages) {
@@ -316,7 +359,7 @@ function reconstructContextEntries(pathEntries) {
   }
 
   if (compactionIdx === -1) {
-    return { keptEntries: pathEntries, stripIds: null };
+    return { keptEntries: pathEntries, stripIds: null, hasCompaction: false };
   }
 
   const comp = pathEntries[compactionIdx];
@@ -333,7 +376,7 @@ function reconstructContextEntries(pathEntries) {
   for (let i = compactionIdx + 1; i < pathEntries.length; i++) keptEntries.push(pathEntries[i]);
 
   const stripIds = new Set(pathEntries.slice(0, compactionIdx).map(e => e.id));
-  return { keptEntries, stripIds };
+  return { keptEntries, stripIds, hasCompaction: true };
 }
 
 function estimateConversationTokens(keptEntries, stripIds) {
@@ -422,7 +465,7 @@ function getLatestContextUsage(workingDir = process.cwd(), liveSessionId = null,
     }
     pathEntries.reverse();
 
-    const { keptEntries, stripIds } = reconstructContextEntries(pathEntries);
+    const { keptEntries, stripIds, hasCompaction } = reconstructContextEntries(pathEntries);
 
     // Mirrors Command Code's /context breakdown: estimated messages, memory
     // files, and the built-in tools + loaded skills baseline.
@@ -430,7 +473,18 @@ function getLatestContextUsage(workingDir = process.cwd(), liveSessionId = null,
     const memoryTokens = estimateMemoryTokens(memoryFiles || getMemoryFiles(workingDir));
     const tokens = messagesTokens + memoryTokens + SYSTEM_TOOLS_AND_SKILLS;
 
-    return { tokens, file: target.name, mtime: target.mtime };
+    // Sanity anchor: a real session can never exceed its own context window,
+    // so keep the last recorded API input size to fall back on.
+    let realTokens = 0;
+    for (let i = keptEntries.length - 1; i >= (hasCompaction ? 1 : 0); i--) {
+      const usage = keptEntries[i].usage;
+      if (usage && typeof usage.inputTokens === 'number' && usage.inputTokens > 0) {
+        realTokens = usage.inputTokens;
+        break;
+      }
+    }
+
+    return { tokens, realTokens, file: target.name, mtime: target.mtime };
   } catch {}
   return null;
 }
@@ -666,7 +720,12 @@ export default function statusBarMod(cmd) {
     const limit = (host && host.limit) || lastKnownLimit;
 
     const disk = getDiskContextUsage(workingDir);
-    if (disk) return formatTokens(disk.tokens, limit);
+    if (disk) {
+      const tokens = (disk.tokens > limit * 1.05 && disk.realTokens > 0)
+        ? disk.realTokens
+        : disk.tokens;
+      return formatTokens(tokens, limit);
+    }
 
     const tokens = estimateMemoryTokens(getMemoryFiles(workingDir)) + SYSTEM_TOOLS_AND_SKILLS;
     return formatTokens(tokens, limit);
